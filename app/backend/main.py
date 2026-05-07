@@ -1,0 +1,49 @@
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+import asyncio
+
+from .agents import orchestrate
+from .sse import format_sse
+
+app = FastAPI()
+
+# Get paths
+FRONTEND_PATH = Path(__file__).parent.parent / "frontend"
+OUTPUT_PATH = Path(__file__).parent.parent / "output"
+
+# Mount static directories
+app.mount("/static", StaticFiles(directory=str(FRONTEND_PATH)), name="static")
+app.mount("/output", StaticFiles(directory=str(OUTPUT_PATH)), name="output")
+
+
+@app.get("/")
+async def root():
+    """Serve the frontend."""
+    return FileResponse(FRONTEND_PATH / "index.html")
+
+
+@app.get("/api/run")
+async def run_orchestration(cached: int = 0):
+    """SSE endpoint that streams the orchestration. cached=1 reuses pre-generated banners (fast demo mode)."""
+
+    async def event_stream():
+        async for event in orchestrate(use_cached_banners=bool(cached)):
+            event_type = event.pop("type")
+            yield format_sse(event_type, event)
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8765)
