@@ -112,6 +112,49 @@ def _placeholder_event(flight: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_FIELD_ALIASES = {
+    # snake_case variants
+    "flight_id": "id",
+    "flight_code": "code",
+    "departure_airport": "origin",
+    "arrival_airport": "destination",
+    "arrival_city": "destination_city",
+    "arrival_country": "destination_country",
+    "flight_date": "date",
+    "seats_total": "total_seats",
+    "seats_sold": "sold_seats",
+    "occupancy_percent": "occupancy_pct",
+    # camelCase variants (the agent picks at random)
+    "flightId": "id",
+    "flightCode": "code",
+    "departureAirport": "origin",
+    "arrivalAirport": "destination",
+    "destinationCity": "destination_city",
+    "destinationCountry": "destination_country",
+    "arrivalCity": "destination_city",
+    "arrivalCountry": "destination_country",
+    "flightDate": "date",
+    "totalSeats": "total_seats",
+    "soldSeats": "sold_seats",
+    "seatsTotal": "total_seats",
+    "seatsSold": "sold_seats",
+    "occupancyPercent": "occupancy_pct",
+    "occupancyPct": "occupancy_pct",
+    "priceEur": "price_eur",
+    "priceEUR": "price_eur",
+}
+
+
+def _normalize_flight(f: Dict[str, Any]) -> Dict[str, Any]:
+    """Tolerate the agent renaming fields. Maps common aliases to the
+    canonical names the rest of the pipeline expects."""
+    out = dict(f)
+    for src, dst in _FIELD_ALIASES.items():
+        if src in out and dst not in out:
+            out[dst] = out.pop(src)
+    return out
+
+
 # ---------------------------------------------------------------------------
 #  Agent #3 — gpt-image-2 banner generator
 # ---------------------------------------------------------------------------
@@ -210,6 +253,7 @@ class FlightsExecutor(Executor):
         try:
             flights = _extract_json(text)
             assert isinstance(flights, list) and flights
+            flights = [_normalize_flight(f) for f in flights]
         except Exception:
             await ctx.add_event(WorkflowEvent.emit(self.id, {
                 "kind": "agent_log",
@@ -335,7 +379,7 @@ async def orchestrate(use_cached_banners: bool = False) -> AsyncGenerator[Dict[s
                     # We only care about our custom 'data' events emitted by
                     # the executors (carry a {"kind": ...} dict).
                     data = getattr(event, "data", None)
-                    if event.type == WorkflowEventType.DATA and isinstance(data, dict) and "kind" in data:
+                    if event.type == "data" and isinstance(data, dict) and "kind" in data:
                         kind = data["kind"]
                         if kind == "agent_log":
                             yield {
@@ -452,22 +496,50 @@ def _align_events_to_flights(
     flights: List[Dict[str, Any]], raw_events: List[Any]
 ) -> List[Dict[str, Any]]:
     """Match the agent's events back to flights by flight_id, falling back to
-    a placeholder event when the agent missed one."""
+    a placeholder event when the agent missed one. Tolerates the agent
+    nesting the event under an 'event' key and using slightly different
+    field names."""
     by_id: Dict[int, Dict[str, Any]] = {}
     for ev in raw_events:
         if not isinstance(ev, dict):
             continue
+        # The agent may put fields at the top level OR nested under "event".
+        nested = ev.get("event") if isinstance(ev.get("event"), dict) else {}
         try:
-            fid = int(ev.get("flight_id"))
+            fid = int(ev.get("flight_id") or ev.get("id"))
         except (TypeError, ValueError):
             continue
-        title = str(ev.get("title") or "").strip()
+        title = (
+            ev.get("title")
+            or nested.get("title")
+            or nested.get("name")
+            or ""
+        )
+        title = str(title).strip()
         if not title:
             continue
+        desc = (
+            ev.get("short_description")
+            or nested.get("short_description")
+            or nested.get("description")
+            or " ".join(
+                str(x) for x in (
+                    nested.get("location"),
+                    nested.get("start_date"),
+                ) if x
+            )
+        )
+        url = (
+            ev.get("source_url")
+            or ev.get("url")
+            or nested.get("source_url")
+            or nested.get("url")
+            or ""
+        )
         by_id[fid] = {
-            "title": title[:80],
-            "short_description": str(ev.get("short_description", ""))[:160],
-            "source_url": str(ev.get("source_url", ""))[:200],
+            "title": str(title)[:80],
+            "short_description": str(desc)[:160],
+            "source_url": str(url)[:200],
         }
     return [by_id.get(f["id"]) or _placeholder_event(f) for f in flights]
 
