@@ -4,7 +4,7 @@ Usage:
     python -m app.scripts.run_events_agent
 
 Invokes the persistent agent `vueling-events-agent` (visible in the Foundry
-portal under project `vueling-demo`) with a sample flights JSON payload.
+portal) under your Foundry project with a sample flights JSON payload.
 """
 import asyncio
 import json
@@ -19,3 +19,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

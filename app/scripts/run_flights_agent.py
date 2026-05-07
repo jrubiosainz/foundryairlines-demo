@@ -4,7 +4,7 @@ Usage:
     python -m app.scripts.run_flights_agent
 
 Invokes the persistent agent `vueling-flights-agent` (visible in the Foundry
-portal under project `vueling-demo`) directly via MAF, without any orchestration.
+portal) under your Foundry project directly via MAF, without any orchestration.
 """
 import asyncio
 from app.backend.agents import run_flights_agent_standalone
@@ -17,3 +17,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

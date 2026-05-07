@@ -3,6 +3,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import asyncio
+import sys
+
+# On Windows the default ProactorEventLoop is incompatible with aiohttp,
+# which the azure-identity / azure-ai-* SDKs use under the hood. Use the
+# selector loop instead — required for the Foundry SDK calls to connect.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from .agents import orchestrate
 from .sse import format_sse

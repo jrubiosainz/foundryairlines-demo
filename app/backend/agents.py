@@ -1,19 +1,23 @@
-"""3-agent FoundryAirlines demo orchestrated with the Foundry **Responses API**.
+"""3-agent demo orchestrated with **Microsoft Agent Framework (MAF)**.
 
-Pipeline:
-  Agent 1 (flights)  : prompt agent — formats the lowest-occupancy flights as JSON
-  Agent 2 (events)   : prompt agent — proposes one cultural event per flight
-  Agent 3 (banner)   : direct REST call to gpt-image-2 (image model, no chat agent)
+Pipeline (following the WorkflowBuilder + sequential pattern from
+https://learn.microsoft.com/en-us/agent-framework/workflows/orchestrations/sequential
+and the worked example at
+https://github.com/dsanchor/agents-observability-tt202/blob/main/from-zero-to-hero/orchestration/demo/sequential_agents.py):
 
-Agents 1 and 2 are **Foundry prompt agents** (declarative `PromptAgentDefinition`)
-created by `bootstrap_agents.py`. They are invoked via the Azure OpenAI
-Responses API exposed by the Foundry project, sharing one `conversation` so
-agent 2 sees agent 1's output as conversation history. This is sequential
-multi-agent orchestration done natively in Foundry — no external orchestrator
-framework required.
+    FlightsExecutor  ──►  EventsExecutor  ──►  (workflow yields the conversation)
+       │ wraps                │ wraps
+       ▼                      ▼
+    flights-agent          events-agent
+    (Foundry prompt        (Foundry prompt
+     agent, persistent)     agent + Bing
+                            Grounding tool)
 
-Doc references:
-  https://learn.microsoft.com/en-us/azure/foundry/agents/quickstarts/prompt-agent?tabs=python
+After the MAF workflow yields its final messages, we run the gpt-image-2
+banner step concurrently outside the workflow (image models aren't chat
+agents and don't fit the executor pattern).
+
+Env vars (via ``app/.env``): see ``app/.env.example``.
 """
 from __future__ import annotations
 
@@ -22,20 +26,33 @@ import base64
 import json
 import os
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
-from dotenv import load_dotenv
+from agent_framework import (
+    Executor,
+    Message,
+    Role,
+    WorkflowBuilder,
+    WorkflowContext,
+    WorkflowEvent,
+    WorkflowEventType,
+    handler,
+)
+from agent_framework.azure import AzureAIAgentClient
 from azure.identity import DefaultAzureCredential
+from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
+from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
 PROJECT_ENDPOINT = os.environ["PROJECT_ENDPOINT"]
 MODEL_DEPLOYMENT_NAME = os.getenv("MODEL_DEPLOYMENT_NAME", "gpt-4.1")
+FLIGHTS_AGENT_NAME = os.getenv("FLIGHTS_AGENT_NAME", "flights-agent")
+EVENTS_AGENT_NAME = os.getenv("EVENTS_AGENT_NAME", "events-agent")
 IMAGE_ENDPOINT = os.getenv("IMAGE_ENDPOINT", "").rstrip("/")
-IMAGE_DEPLOYMENT = os.getenv("IMAGE_DEPLOYMENT")
+IMAGE_DEPLOYMENT = os.getenv("IMAGE_DEPLOYMENT", "gpt-image-2")
 IMAGE_API_VERSION = os.getenv("IMAGE_API_VERSION", "2025-04-01-preview")
 
 ROOT = Path(__file__).parent.parent
@@ -44,7 +61,9 @@ OUTPUT_PATH = ROOT / "output"
 OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
 
 
-# ----------------------- Shared helpers -----------------------------------
+# ============================================================================
+#  Helpers
+# ============================================================================
 
 def _query_low_occupancy(limit: int = 5) -> List[Dict[str, Any]]:
     conn = sqlite3.connect(str(DB_PATH))
@@ -58,198 +77,73 @@ def _query_low_occupancy(limit: int = 5) -> List[Dict[str, Any]]:
         """,
         (limit,),
     )
-    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     conn.close()
-    return [
-        {
-            "id": r[0], "code": r[1], "origin": r[2], "destination": r[3],
-            "destination_city": r[4], "destination_country": r[5],
-            "date": r[6], "total_seats": r[7], "sold_seats": r[8],
-            "price_eur": r[9], "occupancy_pct": round(r[10], 1),
-        }
-        for r in rows
-    ]
+    for r in rows:
+        r["occupancy_pct"] = round(r["occupancy_pct"], 1)
+    return rows
 
 
 def _extract_json(text: str) -> Any:
-    text = text.strip()
-    if "```json" in text:
-        text = text.split("```json", 1)[1].split("```", 1)[0]
-    elif "```" in text:
-        text = text.split("```", 1)[1].split("```", 1)[0]
-    text = text.strip()
-    for opener, closer in (("[", "]"), ("{", "}")):
-        s = text.find(opener)
-        e = text.rfind(closer)
-        if s != -1 and e > s:
-            try:
-                return json.loads(text[s : e + 1])
-            except Exception:
-                continue
-    return json.loads(text)
+    """Tolerant JSON extractor — strips fences and finds the outermost array."""
+    if not text:
+        raise ValueError("empty agent response")
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        nl = s.find("\n")
+        if nl >= 0:
+            s = s[nl + 1 :]
+    start = s.find("[")
+    end = s.rfind("]")
+    if start >= 0 and end > start:
+        return json.loads(s[start : end + 1])
+    return json.loads(s)
 
 
-# ----------------------- Image API Entra ID auth --------------------------
-
-_image_credential = DefaultAzureCredential()
-_token_cache = {"token": None, "expires_on": 0}
-
-
-def _get_cs_token() -> str:
-    now = time.time()
-    if _token_cache["token"] is None or _token_cache["expires_on"] - now < 300:
-        t = _image_credential.get_token("https://cognitiveservices.azure.com/.default")
-        _token_cache["token"] = t.token
-        _token_cache["expires_on"] = t.expires_on
-    return _token_cache["token"]
+def _placeholder_event(flight: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "title": f"{flight['destination_city']} City Highlights",
+        "short_description": (
+            f"Top experiences awaiting you in {flight['destination_city']} this week."
+        ),
+        "source_url": "",
+    }
 
 
-# ----------------------- Foundry prompt-agent wiring ----------------------
-
-_agent_names: Optional[Dict[str, str]] = None
-_project_client = None
-_openai_client = None
-
-
-def _get_agent_names() -> Dict[str, str]:
-    """Lazy-load the prompt-agent NAMES from the bootstrap cache, creating
-    the Foundry prompt agents on first call if they don't yet exist."""
-    global _agent_names
-    if _agent_names is None:
-        from .bootstrap_agents import ensure_persistent_agents
-        ids = ensure_persistent_agents()
-        _agent_names = {
-            "flights": ids.get("flights_name", "vueling-flights-agent"),
-            "events": ids.get("events_name", "vueling-events-agent"),
-        }
-    return _agent_names
-
-
-def _get_project_client():
-    """Singleton AIProjectClient pointed at our Foundry project."""
-    global _project_client
-    if _project_client is None:
-        from azure.ai.projects import AIProjectClient
-        _project_client = AIProjectClient(
-            endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential()
-        )
-    return _project_client
-
-
-def _get_openai_client():
-    """Azure OpenAI client bound to the Foundry project. Used for the
-    Responses API + Conversations endpoints that drive prompt agents."""
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = _get_project_client().get_openai_client()
-    return _openai_client
-
-
-def _agent_reference(name: str) -> Dict[str, Any]:
-    """The `extra_body` shape that targets a named prompt agent on a Responses
-    API call."""
-    return {"agent_reference": {"name": name, "type": "agent_reference"}}
-
-
-async def _call_prompt_agent(conversation_id: str, agent_name: str, user_input: str) -> str:
-    """Invoke a named prompt agent inside an existing conversation and return
-    its output_text. Runs the blocking SDK call in a thread to keep the SSE
-    event loop unblocked."""
-    openai = _get_openai_client()
-
-    def _sync_call() -> str:
-        resp = openai.responses.create(
-            conversation=conversation_id,
-            extra_body=_agent_reference(agent_name),
-            input=user_input,
-        )
-        return resp.output_text or ""
-
-    return await asyncio.to_thread(_sync_call)
-
-
-# ----------------------- Standalone agent runners (for scripts) -----------
-
-async def run_flights_agent_standalone(
-    prompt: Optional[str] = None,
-) -> str:
-    """Invoke just the flights prompt agent and return its text response.
-    Useful for `python -m app.scripts.run_flights_agent`."""
-    names = _get_agent_names()
-    openai = _get_openai_client()
-
-    def _sync():
-        flights_rows = _query_low_occupancy(5)
-        user_input = prompt or (
-            "Format the following flight rows as the JSON array described in your "
-            f"instructions:\n{json.dumps(flights_rows)}"
-        )
-        conv = openai.conversations.create()
-        resp = openai.responses.create(
-            conversation=conv.id,
-            extra_body=_agent_reference(names["flights"]),
-            input=user_input,
-        )
-        return resp.output_text or ""
-
-    return await asyncio.to_thread(_sync)
-
-
-async def run_events_agent_standalone(flights_json: str) -> str:
-    """Invoke just the events prompt agent over a flights JSON payload."""
-    names = _get_agent_names()
-    openai = _get_openai_client()
-
-    def _sync():
-        conv = openai.conversations.create()
-        # Seed the conversation with the flights JSON as context, then ask.
-        prompt = (
-            "The following JSON array of flights is the input. Propose one event "
-            f"per flight as instructed:\n\n{flights_json}"
-        )
-        resp = openai.responses.create(
-            conversation=conv.id,
-            extra_body=_agent_reference(names["events"]),
-            input=prompt,
-        )
-        return resp.output_text or ""
-
-    return await asyncio.to_thread(_sync)
-
-
-# ----------------------- Banner generation (gpt-image-2) ------------------
-
-def _banner_prompt(flight: Dict[str, Any], event: Dict[str, Any]) -> str:
-    return (
-        f"Wide horizontal travel advertising banner, 3:2 aspect ratio, for the airline "
-        f"FoundryAirlines. Destination: {flight['destination_city']}, {flight['destination_country']}. "
-        f"Theme inspired by: {event['title']} ({event['short_description']}). "
-        f"Cinematic high-resolution photography of {flight['destination_city']} at golden "
-        f"hour, vibrant atmosphere. Bold modern typography overlay. Left side: large city "
-        f"name '{flight['destination_city'].upper()}'. Right side: large yellow #FFCC00 "
-        f"price tag '{int(round(flight['price_eur']))} EUR'. Clean composition with white "
-        f"space, FoundryAirlines brand colors: yellow #FFCC00, white, light gray. Premium minimal "
-        f"design. No clutter, accurate spelling, no extra text."
-    )
-
+# ---------------------------------------------------------------------------
+#  Agent #3 — gpt-image-2 banner generator
+# ---------------------------------------------------------------------------
 
 async def generate_banner(
     flight: Dict[str, Any], event: Dict[str, Any], client: httpx.AsyncClient
 ) -> Dict[str, Any]:
-    url = (
-        f"{IMAGE_ENDPOINT}/openai/deployments/{IMAGE_DEPLOYMENT}/images/generations"
-        f"?api-version={IMAGE_API_VERSION}"
+    """Call gpt-image-2 (REST + Entra ID) and persist the PNG. Retries on 429/503."""
+    prompt = (
+        f"Wide promotional travel banner advertising the airline 'FoundryAirlines' flight "
+        f"{flight['code']} from {flight['origin']} to {flight['destination_city']}, "
+        f"{flight['destination_country']} on {flight['date']}. "
+        f"Highlight: \"{event['title']}\" — {event['short_description']}. "
+        f"Show the price '{flight['price_eur']} EUR' tastefully in the bottom-right. "
+        "Painterly travel-poster style, vibrant yellow/white/grey palette, no text typos. "
+        "Cinematic 16:9 composition, high-end advertising aesthetic."
     )
     payload = {
-        "prompt": _banner_prompt(flight, event),
-        "size": "1536x1024",
-        "quality": "low",
+        "prompt": prompt,
         "n": 1,
+        "size": "1536x1024",
         "output_format": "png",
+        "quality": "low",
     }
-    last_err = None
+    cred = DefaultAzureCredential()
+    token = cred.get_token("https://cognitiveservices.azure.com/.default").token
+    url = (
+        f"{IMAGE_ENDPOINT}/openai/deployments/{IMAGE_DEPLOYMENT}"
+        f"/images/generations?api-version={IMAGE_API_VERSION}"
+    )
+    last_err = ""
     for attempt in range(6):
-        token = await asyncio.to_thread(_get_cs_token)
         r = await client.post(
             url,
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -273,116 +167,241 @@ async def generate_banner(
     raise RuntimeError(f"image API failed after retries: {last_err}")
 
 
-def _placeholder_event(flight: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "title": f"{flight['destination_city']} City Highlights",
-        "short_description": (
-            f"Top experiences awaiting you in {flight['destination_city']} this week."
-        ),
-    }
+# ============================================================================
+#  MAF Executors — wrap the two persistent Foundry prompt agents
+# ============================================================================
+# We push **WorkflowEvent.emit(...)** events from inside each executor
+# (custom payloads with a "kind" field). The orchestrator below subscribes
+# to the event stream from `workflow.run(..., stream=True)` and forwards
+# the relevant events to the SSE client.
+
+class FlightsExecutor(Executor):
+    """First step: ask the flights-agent prompt agent to format low-occupancy
+    flights as JSON. The flight rows are loaded from the local SQLite DB."""
+
+    def __init__(self, agent, id: str = "flights"):
+        self._agent = agent
+        super().__init__(id=id)
+
+    @handler
+    async def handle(
+        self,
+        message: Message,
+        ctx: WorkflowContext[List[Message]],
+    ) -> None:
+        flights_rows = _query_low_occupancy(5)
+        await ctx.add_event(WorkflowEvent.emit(self.id, {
+            "kind": "agent_log",
+            "stage": "flights",
+            "log": (
+                f"Local DB query returned {len(flights_rows)} candidate flights — "
+                "sending to flights-agent"
+            ),
+        }))
+
+        prompt_text = (
+            "Format the following raw flight rows as the JSON array described "
+            f"in your instructions:\n{json.dumps(flights_rows)}"
+        )
+        user_msg = Message(role="user", text=prompt_text)
+        response = await self._agent.run(user_msg)
+        text = response.messages[-1].text if response.messages else ""
+
+        try:
+            flights = _extract_json(text)
+            assert isinstance(flights, list) and flights
+        except Exception:
+            await ctx.add_event(WorkflowEvent.emit(self.id, {
+                "kind": "agent_log",
+                "stage": "flights",
+                "log": "Agent output unparseable — falling back to raw DB rows",
+            }))
+            flights = flights_rows
+
+        await ctx.add_event(WorkflowEvent.emit(self.id, {
+            "kind": "flights_ready",
+            "flights": flights,
+        }))
+        # Forward the message chain to the next executor.
+        await ctx.send_message([user_msg, *response.messages])
 
 
-# ----------------------- Public orchestrator ------------------------------
+class EventsExecutor(Executor):
+    """Second step: ask the events-agent prompt agent (Bing Grounding tool
+    attached) to find one real public event per flight."""
+
+    def __init__(self, agent, id: str = "events"):
+        self._agent = agent
+        super().__init__(id=id)
+
+    @handler
+    async def handle(
+        self,
+        messages: List[Message],
+        ctx: WorkflowContext[None, List[Message]],
+    ) -> None:
+        await ctx.add_event(WorkflowEvent.emit(self.id, {
+            "kind": "agent_log",
+            "stage": "events",
+            "log": "Calling events-agent (Bing Grounding tool attached)…",
+        }))
+
+        ask = Message(
+            role="user",
+            text=(
+                "Now use the Bing Grounding tool to find one real upcoming event "
+                "per flight from the JSON array in the previous turn, following "
+                "your instructions. Return only the JSON array."
+            ),
+        )
+        response = await self._agent.run([*messages, ask])
+        text = response.messages[-1].text if response.messages else ""
+
+        try:
+            events = _extract_json(text)
+            if not isinstance(events, list):
+                events = []
+        except Exception:
+            events = []
+
+        await ctx.add_event(WorkflowEvent.emit(self.id, {
+            "kind": "events_ready",
+            "events": events,
+        }))
+        # Final executor → yield workflow output.
+        await ctx.yield_output([*messages, ask, *response.messages])
+
+
+# ============================================================================
+#  Public orchestrator (drives SSE)
+# ============================================================================
 
 async def orchestrate(use_cached_banners: bool = False) -> AsyncGenerator[Dict[str, Any], None]:
-    """SSE-style async generator driving the full 3-agent demo.
-
-    Sequential orchestration is achieved by sharing a single Foundry
-    `conversation` across the two prompt-agent invocations: agent 2 sees
-    agent 1's output as conversation history.
+    """SSE-style async generator.
 
     Front-end contract (event types): agent_start, agent_log, flight, banner,
     agent_done, done, error.
     """
     try:
-        names = _get_agent_names()
-        openai = _get_openai_client()
+        async with AsyncDefaultAzureCredential() as credential:
+            flights_chat_client = AzureAIAgentClient(
+                project_endpoint=PROJECT_ENDPOINT,
+                model_deployment_name=MODEL_DEPLOYMENT_NAME,
+                agent_name=FLIGHTS_AGENT_NAME,
+                credential=credential,
+                should_cleanup_agent=False,
+            )
+            events_chat_client = AzureAIAgentClient(
+                project_endpoint=PROJECT_ENDPOINT,
+                model_deployment_name=MODEL_DEPLOYMENT_NAME,
+                agent_name=EVENTS_AGENT_NAME,
+                credential=credential,
+                should_cleanup_agent=False,
+            )
 
-        # ---- Open one conversation to chain agent 1 → agent 2 ----------
-        conv = await asyncio.to_thread(openai.conversations.create)
-        conversation_id = conv.id
+            async with flights_chat_client, events_chat_client:
+                flights_agent = flights_chat_client.as_agent(name=FLIGHTS_AGENT_NAME)
+                events_agent = events_chat_client.as_agent(name=EVENTS_AGENT_NAME)
 
-        # ============= Agent 1: flights prompt agent ====================
-        yield {"type": "agent_start", "agent": "flights",
-               "message": f"Foundry prompt agent #1 ({names['flights']}) — Responses API"}
-        yield {"type": "agent_log", "agent": "flights",
-               "message": f"conversation {conversation_id[:18]}… opened on Foundry project"}
+                flights_exec = FlightsExecutor(flights_agent)
+                events_exec = EventsExecutor(events_agent)
 
-        flights_rows = _query_low_occupancy(5)
-        yield {"type": "agent_log", "agent": "flights",
-               "message": f"Local DB query returned {len(flights_rows)} candidate flights — sending to prompt agent for formatting"}
+                workflow = (
+                    WorkflowBuilder(
+                        name="FoundryAirlinesSequential",
+                        description="flights-agent → events-agent (Bing Grounding)",
+                        start_executor=flights_exec,
+                    )
+                    .add_edge(flights_exec, events_exec)
+                    .build()
+                )
 
-        flights_input = (
-            "Format the following raw flight rows as the JSON array described in "
-            f"your instructions:\n{json.dumps(flights_rows)}"
-        )
-        flights_text = await _call_prompt_agent(conversation_id, names["flights"], flights_input)
+                yield {
+                    "type": "agent_start",
+                    "agent": "flights",
+                    "message": (
+                        f"MAF workflow started — {FLIGHTS_AGENT_NAME} "
+                        f"→ {EVENTS_AGENT_NAME}"
+                    ),
+                }
 
-        flights: List[Dict[str, Any]] = []
-        try:
-            parsed = _extract_json(flights_text)
-            if isinstance(parsed, list) and parsed:
-                flights = parsed
-        except Exception:
-            pass
-        if not flights:
-            yield {"type": "agent_log", "agent": "flights",
-                   "message": "Prompt agent output unparseable — falling back to raw DB rows"}
-            flights = flights_rows
+                flights: List[Dict[str, Any]] = []
+                events: List[Dict[str, Any]] = []
+                flights_done_emitted = False
 
-        yield {"type": "agent_log", "agent": "flights",
-               "message": f"Agent returned {len(flights)} flights with lowest occupancy"}
-        for f in flights:
-            yield {"type": "flight", "data": f}
-        yield {"type": "agent_done", "agent": "flights"}
+                trigger = Message(role="user", text="Begin the FoundryAirlines pipeline.")
 
-        # ============= Agent 2: events prompt agent =====================
-        yield {"type": "agent_start", "agent": "events",
-               "message": f"Foundry prompt agent #2 ({names['events']}) — same conversation, sees prior turn"}
-        yield {"type": "agent_log", "agent": "events",
-               "message": "Asking prompt agent to propose one event per flight from prior turn"}
-
-        events_input = (
-            "Now propose one plausible cultural or seasonal event per flight from "
-            "the JSON array in the previous turn, following your instructions."
-        )
-        events_text = await _call_prompt_agent(conversation_id, names["events"], events_input)
-
-        events_by_id: Dict[int, Dict[str, Any]] = {}
-        try:
-            parsed_events = _extract_json(events_text)
-            if isinstance(parsed_events, list):
-                for e in parsed_events:
-                    if isinstance(e, dict) and e.get("title"):
-                        fid = e.get("flight_id")
-                        try:
-                            events_by_id[int(fid)] = {
-                                "title": str(e["title"])[:80],
-                                "short_description": str(e.get("short_description", ""))[:160],
+                async for event in workflow.run(trigger, stream=True):
+                    # We only care about our custom 'data' events emitted by
+                    # the executors (carry a {"kind": ...} dict).
+                    data = getattr(event, "data", None)
+                    if event.type == WorkflowEventType.DATA and isinstance(data, dict) and "kind" in data:
+                        kind = data["kind"]
+                        if kind == "agent_log":
+                            yield {
+                                "type": "agent_log",
+                                "agent": data["stage"],
+                                "message": data["log"],
                             }
-                        except (TypeError, ValueError):
-                            continue
-        except Exception:
-            pass
+                        elif kind == "flights_ready":
+                            flights = data["flights"]
+                            yield {
+                                "type": "agent_log",
+                                "agent": "flights",
+                                "message": (
+                                    f"flights-agent returned {len(flights)} flights "
+                                    "with the lowest occupancy"
+                                ),
+                            }
+                            for f in flights:
+                                yield {"type": "flight", "data": f}
+                            yield {"type": "agent_done", "agent": "flights"}
+                            flights_done_emitted = True
+                            yield {
+                                "type": "agent_start",
+                                "agent": "events",
+                                "message": (
+                                    f"{EVENTS_AGENT_NAME} starting "
+                                    "(Bing Grounding tool attached)"
+                                ),
+                            }
+                        elif kind == "events_ready":
+                            events_raw = data["events"]
+                            events = _align_events_to_flights(flights, events_raw)
+                            for f, e in zip(flights, events):
+                                yield {
+                                    "type": "agent_log",
+                                    "agent": "events",
+                                    "message": f"{f['destination_city']}: {e['title']}",
+                                }
+                            yield {"type": "agent_done", "agent": "events"}
 
-        events: List[Dict[str, Any]] = []
-        for f in flights:
-            ev = events_by_id.get(f["id"]) or _placeholder_event(f)
-            events.append(ev)
-            yield {"type": "agent_log", "agent": "events",
-                   "message": f"{f['destination_city']}: {ev['title']}"}
-        yield {"type": "agent_done", "agent": "events"}
+                if not flights_done_emitted:
+                    yield {
+                        "type": "error",
+                        "message": "MAF workflow ended without flights — see backend logs",
+                    }
 
-        # ============= Agent 3: gpt-image-2 banners =====================
-        yield {"type": "agent_start", "agent": "banners",
-               "message": "Calling gpt-image-2 to generate 5 banners (post-workflow concurrent step)…"}
+        # ---- Agent #3: gpt-image-2 banners (concurrent post-workflow) -----
+        yield {
+            "type": "agent_start",
+            "agent": "banners",
+            "message": "Calling gpt-image-2 to generate 5 banners (post-workflow concurrent step)…",
+        }
+
+        if not flights or not events:
+            yield {"type": "agent_log", "agent": "banners",
+                   "message": "No flights/events available — skipping banners"}
+            yield {"type": "agent_done", "agent": "banners"}
+            yield {"type": "done", "message": "All agents completed"}
+            return
 
         if use_cached_banners:
             yield {"type": "agent_log", "agent": "banners",
                    "message": "[cached mode] reusing previously generated banners for fast demo"}
             for f, e in zip(flights, events):
-                cached_path = OUTPUT_PATH / f"banner_{f['id']}.png"
-                if cached_path.exists():
+                cached = OUTPUT_PATH / f"banner_{f['id']}.png"
+                if cached.exists():
                     await asyncio.sleep(2.0)
                     yield {"type": "banner", "data": {
                         "flight_id": f["id"],
@@ -405,11 +424,11 @@ async def orchestrate(use_cached_banners: bool = False) -> AsyncGenerator[Dict[s
                 async with sem:
                     return await generate_banner(f, e, client)
 
-            banner_tasks = [
+            tasks = [
                 asyncio.create_task(_gen(f, e))
                 for f, e in zip(flights, events)
             ]
-            for done in asyncio.as_completed(banner_tasks):
+            for done in asyncio.as_completed(tasks):
                 try:
                     result = await done
                     yield {"type": "banner", "data": result}
@@ -427,3 +446,72 @@ async def orchestrate(use_cached_banners: bool = False) -> AsyncGenerator[Dict[s
         traceback.print_exc()
         yield {"type": "error", "message": str(e)}
         yield {"type": "done", "message": "halted"}
+
+
+def _align_events_to_flights(
+    flights: List[Dict[str, Any]], raw_events: List[Any]
+) -> List[Dict[str, Any]]:
+    """Match the agent's events back to flights by flight_id, falling back to
+    a placeholder event when the agent missed one."""
+    by_id: Dict[int, Dict[str, Any]] = {}
+    for ev in raw_events:
+        if not isinstance(ev, dict):
+            continue
+        try:
+            fid = int(ev.get("flight_id"))
+        except (TypeError, ValueError):
+            continue
+        title = str(ev.get("title") or "").strip()
+        if not title:
+            continue
+        by_id[fid] = {
+            "title": title[:80],
+            "short_description": str(ev.get("short_description", ""))[:160],
+            "source_url": str(ev.get("source_url", ""))[:200],
+        }
+    return [by_id.get(f["id"]) or _placeholder_event(f) for f in flights]
+
+
+# ============================================================================
+#  Standalone runners (used by app/scripts/*)
+# ============================================================================
+
+async def run_flights_agent_standalone(prompt: Optional[str] = None) -> str:
+    async with AsyncDefaultAzureCredential() as credential:
+        client = AzureAIAgentClient(
+            project_endpoint=PROJECT_ENDPOINT,
+            model_deployment_name=MODEL_DEPLOYMENT_NAME,
+            agent_name=FLIGHTS_AGENT_NAME,
+            credential=credential,
+            should_cleanup_agent=False,
+        )
+        async with client:
+            agent = client.as_agent(name=FLIGHTS_AGENT_NAME)
+            flights_rows = _query_low_occupancy(5)
+            user_input = prompt or (
+                "Format the following flight rows as the JSON array described "
+                f"in your instructions:\n{json.dumps(flights_rows)}"
+            )
+            response = await agent.run(Message(role="user", text=user_input))
+            return response.messages[-1].text if response.messages else ""
+
+
+async def run_events_agent_standalone(flights_json: str) -> str:
+    async with AsyncDefaultAzureCredential() as credential:
+        client = AzureAIAgentClient(
+            project_endpoint=PROJECT_ENDPOINT,
+            model_deployment_name=MODEL_DEPLOYMENT_NAME,
+            agent_name=EVENTS_AGENT_NAME,
+            credential=credential,
+            should_cleanup_agent=False,
+        )
+        async with client:
+            agent = client.as_agent(name=EVENTS_AGENT_NAME)
+            user_input = (
+                "The following JSON array of flights is the input. Use the Bing "
+                "Grounding tool to find one real upcoming event per flight as "
+                f"instructed:\n\n{flights_json}"
+            )
+            response = await agent.run(Message(role="user", text=user_input))
+            return response.messages[-1].text if response.messages else ""
+
