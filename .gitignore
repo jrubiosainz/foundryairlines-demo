@@ -43,3 +43,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Squad workflows (excluded from public repo)
+.github/agents/
+.github/workflows/squad-*.yml
+.github/workflows/sync-squad-*.yml
+
