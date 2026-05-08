@@ -296,8 +296,15 @@ class FlightsExecutor(Executor):
             "kind": "flights_ready",
             "flights": flights,
         }))
-        # Forward the message chain to the next executor.
-        await ctx.send_message([user_msg, *response.messages])
+        # Forward a synthesized message containing the canonical (restamped)
+        # flights JSON so the events-agent always sees the right `id` to key
+        # its events on. The agent's raw response would intermittently drop
+        # the id, breaking flight_id-based alignment downstream.
+        canonical_msg = Message(
+            role="assistant",
+            text=json.dumps(flights, ensure_ascii=False),
+        )
+        await ctx.send_message([user_msg, canonical_msg])
 
 
 class EventsExecutor(Executor):
@@ -530,15 +537,13 @@ def _align_events_to_flights(
     nesting the event under an 'event' key and using slightly different
     field names."""
     by_id: Dict[int, Dict[str, Any]] = {}
+    positional: List[Optional[Dict[str, Any]]] = []
     for ev in raw_events:
         if not isinstance(ev, dict):
+            positional.append(None)
             continue
         # The agent may put fields at the top level OR nested under "event".
         nested = ev.get("event") if isinstance(ev.get("event"), dict) else {}
-        try:
-            fid = int(ev.get("flight_id") or ev.get("id"))
-        except (TypeError, ValueError):
-            continue
         title = (
             ev.get("title")
             or nested.get("title")
@@ -547,6 +552,7 @@ def _align_events_to_flights(
         )
         title = str(title).strip()
         if not title:
+            positional.append(None)
             continue
         desc = (
             ev.get("short_description")
@@ -566,12 +572,26 @@ def _align_events_to_flights(
             or nested.get("url")
             or ""
         )
-        by_id[fid] = {
+        clean = {
             "title": str(title)[:80],
             "short_description": str(desc)[:160],
             "source_url": str(url)[:200],
         }
-    return [by_id.get(f.get("id")) or _placeholder_event(f) for f in flights]
+        positional.append(clean)
+        try:
+            fid = int(ev.get("flight_id") or ev.get("id") or nested.get("flight_id"))
+            by_id[fid] = clean
+        except (TypeError, ValueError):
+            pass
+
+    out: List[Dict[str, Any]] = []
+    for i, f in enumerate(flights):
+        match = by_id.get(f.get("id"))
+        # Positional fallback: prompt mandates same length & order as flights.
+        if match is None and i < len(positional) and positional[i] is not None:
+            match = positional[i]
+        out.append(match or _placeholder_event(f))
+    return out
 
 
 # ============================================================================
