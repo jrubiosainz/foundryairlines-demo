@@ -3,6 +3,10 @@
 A small but realistic demo showing how to **orchestrate three Foundry agents
 sequentially** with the Microsoft Agent Framework (MAF) `WorkflowBuilder`.
 
+<img width="1496" height="908" alt="image" src="https://github.com/user-attachments/assets/e69bc73e-7af4-45c3-85d0-555937f2388c" />
+
+
+
 | Step | Agent | Foundry asset | What it does |
 |------|-------|---------------|--------------|
 | 1 | `flights-agent` | Foundry **prompt agent** | Reads a local SQLite "bookings" DB, picks the 5 flights with the lowest occupancy, and returns a strict JSON array. |
