@@ -155,6 +155,31 @@ def _normalize_flight(f: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _restamp_flight_ids(
+    flights: List[Dict[str, Any]], original_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """The flights-agent regularly drops or renames canonical fields (id,
+    destination_city, etc). Hydrate every flight by using the original DB
+    row as the base and letting the agent's output overlay only non-null
+    fields. Match by `code` first, then positional fallback (the prompt
+    mandates same length & order)."""
+    by_code = {r.get("code"): r for r in original_rows if r.get("code")}
+    out: List[Dict[str, Any]] = []
+    for i, f in enumerate(flights):
+        match = by_code.get(f.get("code"))
+        if match is None and i < len(original_rows):
+            match = original_rows[i]
+        if match is None:
+            out.append(f)
+            continue
+        merged = dict(match)
+        for k, v in f.items():
+            if v is not None:
+                merged[k] = v
+        out.append(merged)
+    return out
+
+
 # ---------------------------------------------------------------------------
 #  Agent #3 — gpt-image-2 banner generator
 # ---------------------------------------------------------------------------
@@ -261,6 +286,11 @@ class FlightsExecutor(Executor):
                 "log": "Agent output unparseable — falling back to raw DB rows",
             }))
             flights = flights_rows
+
+        # The agent sometimes drops "id" even when instructed to keep it.
+        # Re-stamp ids from the original DB rows, matching by flight code first
+        # and falling back to positional alignment.
+        flights = _restamp_flight_ids(flights, flights_rows)
 
         await ctx.add_event(WorkflowEvent.emit(self.id, {
             "kind": "flights_ready",
@@ -541,7 +571,7 @@ def _align_events_to_flights(
             "short_description": str(desc)[:160],
             "source_url": str(url)[:200],
         }
-    return [by_id.get(f["id"]) or _placeholder_event(f) for f in flights]
+    return [by_id.get(f.get("id")) or _placeholder_event(f) for f in flights]
 
 
 # ============================================================================
