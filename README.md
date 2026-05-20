@@ -4,6 +4,7 @@ A small but realistic demo showing how to **orchestrate three Foundry agents
 sequentially** with the Microsoft Agent Framework (MAF) `WorkflowBuilder`.
 
 <img width="1496" height="908" alt="image" src="https://github.com/user-attachments/assets/e69bc73e-7af4-45c3-85d0-555937f2388c" />
+<img width="1525" height="752" alt="image" src="https://github.com/user-attachments/assets/55df87c7-7c13-4e29-9242-8a4d208d4941" />
 
 
 
